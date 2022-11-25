@@ -1,3 +1,5 @@
+param([Parameter(Mandatory=$true)][string]$SearchText)
+
 Add-Type -AssemblyName System.Windows.Forms
 <#
 
@@ -13,6 +15,7 @@ cd "C:\Path\to\script"
 
 #>
 
+$ErrorActionPreference = "Stop"
 [string]$RF_path = [string]::Empty
 
 #region attempt to retrieve RF root folder from registry
@@ -21,6 +24,7 @@ cd "C:\Path\to\script"
     @{ Path = "HKLM:\SOFTWARE\Volition\Red Faction"; AccessKey = "InstallPath" }, # legacy 32-bit
     @{ Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 20530"; AccessKey = "InstallLocation" }, # steam
     @{ Path = "HKLM:\SOFTWARE\GOG.com\GOGREDFACTION"; AccessKey = "PATH" } # GOG
+    @{ Path = "HKCU:\SOFTWARE\$($MyInvocation.MyCommand.Name)"; AccessKey = "RFPath" }
 )
 
 foreach ($r in $RegistryPaths) {
@@ -29,7 +33,6 @@ foreach ($r in $RegistryPaths) {
         if ($RF_path.Length -gt 0) { break }
     }
 }
-#endregion
 
 if (($RF_path.Length -eq 0) -or (-not (Test-Path -LiteralPath $RF_path))) {
     [System.Windows.Forms.MessageBox]::Show("Unable to find RF folder.`nYou will be prompted to browse for the path yourself.", "Unable to find default RF folder", "OK", "Information")
@@ -40,18 +43,27 @@ if (($RF_path.Length -eq 0) -or (-not (Test-Path -LiteralPath $RF_path))) {
 
     if ($fbd.ShowDialog() -eq "OK") {
         $RF_path = $fbd.SelectedPath
+
+        if (Test-Path -Path "HKCU:\SOFTWARE\$($MyInvocation.MyCommand.Name)") {
+            Set-ItemProperty -Path "HKCU:\SOFTWARE\$($MyInvocation.MyCommand.Name)" -Name "RFPath" -Value $RF_path | Out-Null
+        } else {
+            New-Item -Path "HKCU:\SOFTWARE" -Name $MyInvocation.MyCommand.Name | Out-Null
+            New-ItemProperty -Path "HKCU:\SOFTWARE\$($MyInvocation.MyCommand.Name)" -Name "RFPath" -Value $RF_path | Out-Null
+        }
+    } else {
+        Write-Host "Unable to find RF root folder" -ForegroundColor Red
+        Exit
     }
 
     if ($RF_path.Length -eq 0) {
         Write-Host "Unable to run the program unless you select your RF root folder"
     }
 }
-
-[string]$search_text = [string]::Join(" ", $Args).ToUpper()
+#endregion
 
 class VPPPosition {
-    static [int]Calculate([int]$inpt) {
-        [int]$output = $inpt
+    static [UInt32]Calculate([UInt32]$inpt) {
+        [UInt32]$output = $inpt
 
         if ($inpt % 2048 -ne 0) {
             $output = $inpt - ($inpt % 2048)
@@ -63,118 +75,134 @@ class VPPPosition {
 }
 
 if (Test-Path -LiteralPath $RF_path) {
-    if ($search_text.Trim().Length -eq 0) {
-        $search_text = Read-Host "Enter your search text"
-    }
-
     [System.Collections.Generic.List[HashTable]]$match_table = New-Object System.Collections.Generic.List[HashTable]
+    [System.IO.BinaryReader]$reader = $null
 
-    # loop thru the list of VPP files in the RF folder
-    Get-ChildItem *.vpp -LiteralPath $RF_path -File -Recurse | ForEach-Object {
-        # retrieve full path to VPP file
-        [string]$VPP_Filename = $_.FullName
+    try {
+        # loop thru the list of VPP files in the RF folder
+        Get-ChildItem *.vpp -LiteralPath $RF_path -File -Recurse | ForEach-Object {
+            try {
+                [string]$VPP_Filename = $_.FullName
+                [byte[]]$buffer = [byte[]]::CreateInstance([byte], 60)
+                $reader = New-Object System.IO.BinaryReader((New-Object System.IO.FileStream($VPP_Filename, "Open")))
 
-        # read VPP data into memory
-        [byte[]]$bytes = [System.IO.File]::ReadAllBytes($VPP_Filename)
+                # read VPP header information
+                [UInt32]$signature = $reader.ReadUInt32()
+                [UInt32]$version = $reader.ReadUInt32()
 
-        # read VPP header information
-        [int]$signature = [System.BitConverter]::ToInt32($bytes, 0)
-        [int]$version = [System.BitConverter]::ToInt32($bytes, 4)
+                # check that VPP header is well-formed
+                if (($signature -eq 0x51890ace) -and ($version -eq 1)) {
+                    # read file count in VPP (byte positions 8-11)
+                    [UInt32]$num_files = $reader.ReadUInt32()
 
-        # check that VPP header is well-formed
-        if (($signature -eq 0x51890ace) -and ($version -eq 1)) {
-            # read file count in VPP (byte positions 8-11)
-            [int]$num_files = [System.BitConverter]::ToInt32($bytes, 8)
+                    [UInt32]$prev_position = 2048
+                    [UInt32]$prev_size = 64 * $num_files
 
-            [int]$prev_position = 0
-            [int]$prev_size = 0
+                    for ([int]$n = 0; $n -lt $num_files; $n++) {
+                        [void]$reader.BaseStream.Seek(2048 + $n*64, "Begin")
 
-            for ([int]$n = 0; $n -lt $num_files; $n++) {
-                # filename in first 60 bytes of current position, replace null characters
-                [string]$filename = [System.Text.Encoding]::ASCII.GetString($bytes, 2048 + $n*64, 60) -replace '\x00',''
+                        # filename in first 60 bytes of current position
+                        [void]$reader.Read($buffer, 0, 60)
+                        [string]$filename = [System.Text.Encoding]::ASCII.GetString($buffer).Split([byte]0)[0]
 
-                # file size in next 4 bytes
-                [int]$filesize = [System.BitConverter]::ToInt32($bytes, 2048 + $n*64 + 60)
+                        # file size in next 4 bytes
+                        [UInt32]$filesize = $reader.ReadUInt32()
 
-                # calculate position to raw file data
-                [int]$curr_position = [VPPPosition]::Calculate($(if ($n -eq 0) {2048 + 64 * $num_files} else {$prev_position + $prev_size}))
+                        # calculate position to raw file data
+                        [UInt32]$curr_position = [VPPPosition]::Calculate($prev_position + $prev_size)
 
-                # if filename contains search text
-                if ($filename.ToLower().Contains($search_text.ToLower()) -or ($filename -like $search_text)) {
-                    $match_table.Add(@{
-                        Filename = $filename
-                        Size = $filesize
-                        Position = $curr_position
-                        VPP_Filename = $VPP_Filename
-                    })
-                    # print a match
-                    Write-Host "$($match_table.Count). '$filename', $([math]::Round($filesize / 1KB, 2)) KiB in '$VPP_Filename'" -ForegroundColor Green
+                        # if filename contains search text
+                        if ($filename.ToLower().Contains($SearchText.ToLower()) -or ($filename -like $SearchText)) {
+                            $match_table.Add(@{
+                                Filename = $filename
+                                Size = $filesize
+                                Position = $curr_position
+                                VPP_Filename = $VPP_Filename
+                            })
+                            # print a match
+                            Write-Host "$($match_table.Count). '$filename', $([math]::Round($filesize / 1KB, 2)) KiB in '$VPP_Filename'" -ForegroundColor Green
+                        }
+
+                        # track previous size and position
+                        $prev_size = $filesize
+                        $prev_position = $curr_position
+                    }
+                }
+            } catch {
+                if ($_.Exception.Message -notlike "*Access to the path*is denied*") {
+                    throw $_
+                }
+            }
+
+            $reader.Close()
+        }
+
+        # if matches found
+        if ($match_table.Count -gt 0) {
+            [bool]$prompt_extract = $true
+            [int]$extract_count = 0
+
+            # prompt for save
+            [string]$file_to_extract = [string]::Empty
+
+            while ($prompt_extract) {
+                if ($extract_count -eq 0) {
+                    $file_to_extract = Read-Host "Would you like to extract any of the results? Type the number to extract, or X to quit"
+                } else {
+                    $file_to_extract = Read-Host "Type the number to extract another, or X to quit"
                 }
 
-                # track previous size and position
-                $prev_size = $filesize
-                $prev_position = $curr_position
-            }
-        }
-    }
+                if ((-not $file_to_extract.StartsWith("0")) -and ($file_to_extract -match "^[0-9]+$")) {
+                    # retrieve file record to save
+                    $filenum = [int]$file_to_extract
 
-    # if matches found
-    if ($match_table.Count -gt 0) {
-        [bool]$prompt_extract = $true
-        [int]$extract_count = 0
+                    if ($filenum -le $match_table.Count) {
+                        [Hashtable]$file_record = $match_table[$filenum - 1]
 
-        # prompt for save
-        [string]$file_to_extract = [string]::Empty
+                        # read VPP into memory
+                        $reader = New-Object System.IO.BinaryReader((New-Object System.IO.FileStream($file_record.VPP_Filename, "Open")))
+                        [void]$reader.BaseStream.Seek($file_record.Position, "Begin")
 
-        while ($prompt_extract) {
-            if ($extract_count -eq 0) {
-                $file_to_extract = Read-Host "Would you like to extract any of the results? Type the number to extract, or X to quit"
-            } else {
-                $file_to_extract = Read-Host "Type the number to extract another, or X to quit"
-            }
+                        # retrieve file data from VPP
+                        $buffer = [byte[]]::CreateInstance([byte], $file_record.Size)
+                        [void]$reader.Read($buffer, 0, $file_record.Size)
 
-            if ((-not $file_to_extract.StartsWith("0")) -and ($file_to_extract -match "^[0-9]+$")) {
-                # retrieve file record to save
-                $filenum = [int]$file_to_extract
+                        # determine file extension
+                        [int]$extension_idx = $file_record.Filename.LastIndexOf(".")
+                        [string]$extension = [string]::Empty
 
-                if ($filenum -le $match_table.Count) {
-                    [HashTable]$file_record = $match_table[$filenum - 1]
+                        if ($extension_idx -gt 0) {
+                            $extension = $file_record.Filename.Substring($extension_idx)
+                        }
 
-                    # read VPP into memory
-                    [byte[]]$vpp_bytes = [System.IO.File]::ReadAllBytes($file_record.VPP_Filename)
+                        # initialize save dialog
+                        $FileDialog = New-Object System.Windows.Forms.SaveFileDialog -Property @{
+                            Filter = @(if ($extension.Length -gt 0) {"$($extension.Substring(1).ToUpper()) files (*$extension)|*$extension"} else {"All files (*.*)|*.*"})
+                            Filename = $file_record.Filename
+                        }
 
-                    # retrieve file data from VPP
-                    [byte[]]$file_data = $vpp_bytes[($file_record.Position)..($file_record.Position + $file_record.Size - 1)]
+                        if ($FileDialog.ShowDialog() -eq 'OK') {
+                            # write the file to disk
+                            [System.IO.File]::WriteAllBytes($FileDialog.FileName, $buffer)
+                            Write-Host "Saved '$($FileDialog.FileName)'"
+                            $extract_count++
+                        }
 
-                    # determine file extension
-                    [int]$extension_idx = $file_record.Filename.LastIndexOf(".")
-                    [string]$extension = [string]::Empty
-
-                    if ($extension_idx -gt 0) {
-                        $extension = $file_record.Filename.Substring($extension_idx)
-                    }
-
-                    # initialize save dialog
-                    $FileDialog = New-Object System.Windows.Forms.SaveFileDialog -Property @{
-                        Filter = @(if ($extension.Length -gt 0) {"$($extension.Substring(1).ToUpper()) files (*$extension)|*$extension"} else {"All files (*.*)|*.*"})
-                        Filename = $file_record.Filename
-                    }
-
-                    if ($FileDialog.ShowDialog() -eq 'OK') {
-                        # write the file to disk
-                        [System.IO.File]::WriteAllBytes($FileDialog.FileName, $file_data)
-                        Write-Host "Saved '$($FileDialog.FileName)'"
-                        $extract_count++
+                        $reader.Close()
+                    } else {
+                        Write-Host "There are only $($match_table.Count) records listed above. Try again." -ForegroundColor Red
                     }
                 } else {
-                    Write-Host "There are only $($match_table.Count) records listed above. Try again." -ForegroundColor Red
+                    $prompt_extract = $false
+                    Write-Host "Quitting"
                 }
-            } else {
-                $prompt_extract = $false
-                Write-Host "Quitting"
             }
         }
+    } catch {
+        Write-Host $_.Exception.Message -ForegroundColor Red
+
+        if ($null -ne $reader) {
+            $reader.Close()
+        }
     }
-} else {
-    Write-Host "'$RF_path' does not exist!`nBe sure to update the variable `$RF_path to your actual RF folder path." -ForegroundColor Yellow
 }

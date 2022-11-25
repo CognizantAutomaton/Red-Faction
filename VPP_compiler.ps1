@@ -8,6 +8,7 @@ Add-Type -AssemblyName System.Windows.Forms
     @{ Path = "HKLM:\SOFTWARE\Volition\Red Faction"; AccessKey = "InstallPath" }, # legacy 32-bit
     @{ Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 20530"; AccessKey = "InstallLocation" }, # steam
     @{ Path = "HKLM:\SOFTWARE\GOG.com\GOGREDFACTION"; AccessKey = "PATH" } # GOG
+    @{ Path = "HKCU:\SOFTWARE\$($MyInvocation.MyCommand.Name)"; AccessKey = "RFPath" }
 )
 
 foreach ($r in $RegistryPaths) {
@@ -16,12 +17,38 @@ foreach ($r in $RegistryPaths) {
         if ($InstallLocation.Length -gt 0) { break }
     }
 }
+
+if (($InstallLocation.Length -eq 0) -or (-not (Test-Path -LiteralPath $InstallLocation))) {
+    [System.Windows.Forms.MessageBox]::Show("Unable to find RF folder.`nYou will be prompted to browse for the path yourself.", "Unable to find default RF folder", "OK", "Information")
+
+    $fbd = New-Object System.Windows.Forms.FolderBrowserDialog -Property @{
+        Description = "Browse to RF root folder"
+    }
+
+    if ($fbd.ShowDialog() -eq "OK") {
+        $InstallLocation = $fbd.SelectedPath
+
+        if (Test-Path -Path "HKCU:\SOFTWARE\$($MyInvocation.MyCommand.Name)") {
+            Set-ItemProperty -Path "HKCU:\Software\$($MyInvocation.MyCommand.Name)" -Name "RFPath" -Value $InstallLocation | Out-Null
+        } else {
+            New-Item -Path "HKCU:\Software" -Name $MyInvocation.MyCommand.Name | Out-Null
+            New-ItemProperty -Path "HKCU:\Software\$($MyInvocation.MyCommand.Name)" -Name "RFPath" -Value $InstallLocation | Out-Null
+        }
+    } else {
+        Write-Host "Unable to find RF root folder" -ForegroundColor Red
+        Exit
+    }
+
+    if ($InstallLocation.Length -eq 0) {
+        Write-Host "Unable to run the program unless you select your RF root folder"
+    }
+}
 #endregion
 
 #region functions
 class VPPPosition {
-    static [int]Calculate([int]$inpt) {
-        [int]$output = $inpt
+    static [int]Calculate([UInt32]$inpt) {
+        [UInt32]$output = $inpt
 
         if ($inpt % 2048 -ne 0) {
             $output = $inpt - ($inpt % 2048)
@@ -33,6 +60,59 @@ class VPPPosition {
 }
 
 [ScriptBlock]$LoadVPPFile = {
+    param([string]$VPP_Filename, [Hashtable]$VPP_File)
+
+    [System.IO.BinaryReader]$reader = $null
+    $VPP_File.Files.Clear()
+    $VPP_File.Filepath = $VPP_Filename
+
+    try {
+        $reader = New-Object System.IO.BinaryReader((New-Object System.IO.FileStream($VPP_Filename, "Open")))
+        [void]$reader.BaseStream.Seek(0, "Begin")
+
+        [byte[]]$buffer = [byte[]]::CreateInstance([byte], 12)
+        [void]$reader.Read($buffer, 0, 12)
+        [UInt32]$signature = [System.BitConverter]::ToUInt32($buffer, 0)
+        [UInt32]$version = [System.BitConverter]::ToUInt32($buffer, 4)
+
+        if (($signature -eq 0x51890ace) -and ($version -eq 1)) {
+            [UInt32]$num_files = [System.BitConverter]::ToUInt32($buffer, 8)
+            [UInt32]$offset = 0x800
+
+            [UInt32]$prev_position = 0x800
+            [UInt32]$prev_size = 64 * $num_files
+
+            for ([int]$n = 0; $n -lt $num_files; $n++) {
+                [void]$reader.BaseStream.Seek(0x800 + $n*64, "Begin")
+
+                # filename in first 60 bytes of current position
+                [string]$filename = [System.Text.Encoding]::ASCII.GetString($reader.ReadBytes(60)).Split([byte]0)[0]
+                [UInt32]$filesize = $reader.ReadUInt32()
+                [UInt32]$curr_position = [VPPPosition]::Calculate($prev_position + $prev_size)
+
+                [void]$VPP_File.Files.Add(@{
+                    Filename = $filename
+                    Size = $filesize
+                    Position = $curr_position
+                })
+
+                $offset += 64
+                $prev_position = $curr_position
+                $prev_size = $filesize
+            }
+        } else {
+            Write-Host "$($ofd.FileName) is not well-formed" -ForegroundColor Red
+        }
+    } catch {
+        Write-Host $_.Exception.Message -ForegroundColor Red
+    }
+
+    if ($null -ne $reader) {
+        $reader.Close()
+    }
+}
+
+[ScriptBlock]$TriggerLoadVPPFile = {
     param([Hashtable]$VPP_File)
 
     $ofd = New-Object System.Windows.Forms.OpenFileDialog -Property @{
@@ -45,41 +125,9 @@ class VPPPosition {
     }
 
     if ($ofd.ShowDialog() -eq "OK") {
-        [string]$filename = $ofd.FileName
-        [byte[]]$vpp_file_bytes = [System.IO.File]::ReadAllBytes($filename)
-        [uint32]$signature = [System.BitConverter]::ToUInt32($vpp_file_bytes, 0)
-        [uint32]$version = [System.BitConverter]::ToUInt32($vpp_file_bytes, 4)
-
-        if (($signature -eq 0x51890ace) -and ($version -eq 1)) {
-            Write-Host "Loading '$filename'"
-
-            $VPP_File.Files.Clear()
-            $VPP_File.Filepath = $filename
-            [uint32]$vpp_num_files = [System.BitConverter]::ToUInt32($vpp_file_bytes, 8)
-            [uint32]$offset = 0x800
-
-            for ([int]$n = 0; $n -lt $vpp_num_files; $n++) {
-                [string]$filename = [System.Text.Encoding]::ASCII.GetString($vpp_file_bytes, $offset, 60) -replace '\x00',''
-                [uint32]$filesize = [System.BitConverter]::ToUInt32($vpp_file_bytes, $offset + 60)
-                [uint32]$position = [VPPPosition]::Calculate($(if ($n -eq 0) { 0x800 + 64 * $vpp_num_files } else { $VPP_File.Files[-1].Position + $VPP_File.Files[-1].Size }))
-
-                [void]$VPP_File.Files.Add(@{
-                    Filename = $filename
-                    Size = $filesize
-                    Position = $position
-                    Data = [byte[]]::CreateInstance([byte], $filesize)
-                })
-                [Array]::Copy($vpp_file_bytes, $position, $VPP_File.Files[-1].Data, 0, $filesize)
-
-                $offset += 64
-            }
-
-            $vpp_file_bytes = $null
-
-            Write-Host "$vpp_num_files files loaded from '$filename'" -ForegroundColor Green
-        } else {
-            Write-Host "$filename is not well-formed" -ForegroundColor Red
-        }
+        Write-Host "Loading '$($ofd.FileName)'"
+        $LoadVPPFile.Invoke($ofd.FileName, $VPP_File)
+        Write-Host "$($VPP_File.Files.Count) files loaded from '$($ofd.FileName)'" -ForegroundColor Green
     } else {
         Write-Host "Cancelled"
     }
@@ -137,19 +185,16 @@ class VPPPosition {
 
                 if ($prompt_replace.ToLower() -eq "y") {
                     Write-Host "Replacing '$file'" -ForegroundColor Green
-                    $existing_file.Data = [byte[]]::CreateInstance([byte], $item.Length)
                     $existing_file.Size = $item.Length
-                    [Array]::Copy([System.IO.File]::ReadAllBytes($item.FullName), 0, $existing_file.Data, 0, $item.Length)
                 } else {
                     Write-Host "Skipping '$($item.FullName)'"
                 }
             } else {
                 Write-Host "Adding '$file'" -ForegroundColor Green
                 $VPP_File.Files.Add(@{
-                    Filename = $item.Name
+                    Filename = $item.FullName
                     Size = $item.Length
                     Position = -1 # will be calculated upon VPP save
-                    Data = [System.IO.File]::ReadAllBytes($item.FullName)
                 })
             }
         }
@@ -290,7 +335,7 @@ class VPPPosition {
                                 $extension = $existing_file.Filename.Substring($ext_idx)
                                 $extension = "$($extension.Substring(1).ToUpper()) files (*$extension)|*$($extension)"
                             }
-        
+
                             $sfd = New-Object System.Windows.Forms.SaveFileDialog -Property @{
                                 Filter = $extension
                                 Title = "Extract file"
@@ -300,9 +345,22 @@ class VPPPosition {
                             if (($InstallLocation.Length -gt 0) -and (Test-Path -LiteralPath $InstallLocation)) {
                                 $sfd.InitialDirectory = $InstallLocation
                             }
-            
+
+                            [System.IO.BinaryReader]$reader = $null
                             if ($sfd.ShowDialog() -eq "OK") {
-                                [System.IO.File]::WriteAllBytes($sfd.FileName, $existing_file.Data)
+                                try {
+                                    $reader = New-Object System.IO.BinaryReader((New-Object System.IO.FileStream($VPP_File.Filepath, "Open")))
+                                    [void]$reader.BaseStream.Seek($existing_file.Position, "Begin")
+                                    [byte[]]$buffer = [byte[]]::CreateInstance([byte], $existing_file.Size)
+                                    [void]$reader.Read($buffer, 0, $existing_file.Size)
+                                    [System.IO.File]::WriteAllBytes($sfd.FileName, $buffer)
+                                } catch {
+                                    Write-Host $_.Exception.Message -ForegroundColor Red
+                                }
+
+                                if ($null -ne $reader) {
+                                    $reader.Close()
+                                }
                                 Write-Host "Extracted '$($sfd.FileName)'" -ForegroundColor Green
                             } else {
                                 Write-Host "Cancelled"
@@ -337,10 +395,27 @@ class VPPPosition {
         }
 
         if ($fbd.ShowDialog() -eq "OK") {
-            # write each file to selected path
-            foreach ($file in $VPP_File.Files) {
-                $savepath = Join-Path $fbd.SelectedPath $file.Filename
-                [System.IO.File]::WriteAllBytes($savepath, $file.Data)
+            [System.IO.BinaryReader]$reader = $null
+
+            try {
+                $reader = New-Object System.IO.BinaryReader((New-Object System.IO.FileStream($VPP_File.Filepath, "Open")))
+
+                # write each file to selected path
+                foreach ($file in ($VPP_File.Files | Where-Object { $_.Position -gt -1 })) {
+                    $savepath = Join-Path $fbd.SelectedPath $file.Filename
+
+                    $buffer = [byte[]]::CreateInstance([byte], $existing_file.Size)
+                    [void]$reader.BaseStream.Seek($existing_file.Position, "Begin")
+                    [byte[]]$buffer = [byte[]]::CreateInstance([byte], $existing_file.Size)
+                    [void]$reader.Read($buffer, 0, $existing_file.Size)
+                    [System.IO.File]::WriteAllBytes($savepath, $buffer)
+                }
+            } catch {
+                Write-Host $_.Exception.Message -ForegroundColor Red
+            }
+
+            if ($null -ne $reader) {
+                $reader.Close()
             }
 
             Write-Host "$($VPP_File.Files.Count) files have been extracted to '$($fbd.SelectedPath)'" -ForegroundColor Green
@@ -367,52 +442,97 @@ class VPPPosition {
         }
 
         if ($sfd.ShowDialog() -eq "OK") {
-            $VPP_File.Filepath = $sfd.FileName
+            [System.IO.FileStream]$stream = $null
+            [System.IO.StreamWriter]$writer = $null
+            [System.IO.BinaryReader]$CurrentReader = $null
+            [string]$tmp_filename = Join-Path ([IO.Path]::GetDirectoryName($sfd.FileName)) "$((New-Guid).Guid).tmp"
+            [byte[]]$buffer = $null
 
             # calculate VPP save positions
-            [uint32]$curr_position = [VPPPosition]::Calculate(0x800 + 64 * $VPP_File.Files.Count)
-            [uint32]$next_position = 0
+            [UInt32]$curr_position = [VPPPosition]::Calculate(0x800 + 64 * $VPP_File.Files.Count)
+            [UInt32]$next_position = 0
             foreach ($file in ($VPP_File.Files | Sort-Object -Property Filename)) {
                 $next_position = [VPPPosition]::Calculate($curr_position + $file.Size)
                 $file.Position = $curr_position
                 $curr_position = $next_position
             }
 
-            [uint32]$vpp_total_size = $next_position
+            [UInt32]$vpp_total_size = $next_position
+            [byte[]]@([byte]0) | Set-Content -LiteralPath $tmp_filename -AsByteStream
 
-            [byte[]]$vpp_file_bytes = [byte[]]::CreateInstance([byte], $vpp_total_size)
-            [Array]::Clear($vpp_file_bytes, 0, $vpp_total_size)
+            try {
+                $stream = New-Object IO.FileStream($tmp_filename, "Open", "ReadWrite")
+                $writer = New-Object IO.StreamWriter($stream)
+                $CurrentReader = New-Object System.IO.BinaryReader((New-Object System.IO.FileStream($VPP_File.Filepath, "Open")))
 
-            # write VPP header
-            [Array]::Copy([System.BitConverter]::GetBytes(0x51890ace), 0, $vpp_file_bytes, 0, 4)
-            [Array]::Copy([System.BitConverter]::GetBytes(1), 0, $vpp_file_bytes, 4, 4)
-            [Array]::Copy([System.BitConverter]::GetBytes($VPP_File.Files.Count), 0, $vpp_file_bytes, 8, 4)
-            [Array]::Copy([System.BitConverter]::GetBytes($vpp_total_size), 0, $vpp_file_bytes, 12, 4)
+                [void]$writer.BaseStream.SetLength($vpp_total_size)
+                [void]$writer.BaseStream.Seek(0, "Begin")
 
-            [uint32]$offset = 0x800
+                # write VPP header
+                [void]$writer.BaseStream.Write([System.BitConverter]::GetBytes(0x51890ace), 0, 4)
+                [void]$writer.BaseStream.Write([System.BitConverter]::GetBytes(1), 0, 4)
+                [void]$writer.BaseStream.Write([System.BitConverter]::GetBytes($VPP_File.Files.Count), 0, 4)
+                [void]$writer.BaseStream.Write([System.BitConverter]::GetBytes($vpp_total_size), 0, 4)
 
-            foreach ($file in ($VPP_File.Files | Sort-Object -Property Filename)) {
-                [string]$filename = $file.Filename
+                [UInt32]$offset = 0x800
 
-                if ($filename.Length -gt 60) {
-                    $filename = $filename.Substring(0, 60)
+                foreach ($file in ($VPP_File.Files | Sort-Object -Property Filename)) {
+                    [string]$filename = $file.Filename
+
+                    if ($file.Position -eq -1) {
+                        # retrieve file data from filesystem
+                        $buffer = [IO.File]::ReadAllBytes($filename)
+                        $filename = [IO.Path]::GetFileName($filename)
+                    } else {
+                        # seek file data within vpp
+                        $buffer = [byte[]]::CreateInstance([byte], $file.Size)
+                        [void]$CurrentReader.BaseStream.Seek($file.Position, "Begin")
+                        [void]$CurrentReader.Read($buffer, 0, $file.Size)
+                    }
+
+                    if ($filename.Length -gt 60) {
+                        $filename = $filename.Substring(0, 60)
+                    }
+
+                    # write file index info
+                    [void]$writer.BaseStream.Seek($offset, "Begin")
+                    [void]$writer.BaseStream.Write([System.Text.Encoding]::ASCII.GetBytes($filename), 0, $filename.Length)
+                    [void]$writer.BaseStream.Seek($offset+60, "Begin")
+                    [void]$writer.BaseStream.Write([System.BitConverter]::GetBytes($file.Size), 0, 4)
+
+                    # write file data
+                    [void]$writer.BaseStream.Seek($file.Position, "Begin")
+                    [void]$writer.BaseStream.Write($buffer, 0, $buffer.Count)
+
+                    $offset += 64
                 }
-
-                # write file index info
-                [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes($filename), 0, $vpp_file_bytes, $offset, $filename.Length)
-                [Array]::Copy([System.BitConverter]::GetBytes($file.Size), 0, $vpp_file_bytes, $offset + 60, 4)
-
-                # write file data
-                [Array]::Copy($file.Data, 0, $vpp_file_bytes, $file.Position, $file.Size)
-
-                $offset += 64
+            } catch {
+                Write-Host $_.Exception.Message -ForegroundColor Red
             }
 
-            # save VPP to disk
-            [System.IO.File]::WriteAllBytes($VPP_File.Filepath, $vpp_file_bytes)
-            $vpp_file_bytes = $null
+            if ($null -ne $writer) {
+                $writer.Close()
+            }
+            if ($null -ne $stream) {
+                $stream.Close()
+            }
+            if ($null -ne $CurrentReader) {
+                $CurrentReader.Close()
+            }
 
-            Write-Host "Saved '$($VPP_File.Filepath)'" -ForegroundColor Green
+            try {
+                if (Test-Path -LiteralPath $sfd.FileName) {
+                    Remove-Item -LiteralPath $sfd.FileName -Force
+                }
+
+                Rename-Item -LiteralPath $tmp_filename -NewName $sfd.FileName
+
+                $LoadVPPFile.Invoke($sfd.FileName, $VPP_File)
+            } catch {
+                Write-Host $_ -ForegroundColor Red
+            }
+
+            Write-Host "Saved '$($sfd.FileName)'" -ForegroundColor Green
         } else {
             Write-Host "Cancelled"
         }
@@ -431,7 +551,7 @@ class VPPPosition {
 }
 
 [Array]$MenuOptions = @(
-    @{ Key = "1"; Text = "Load a VPP file"; Action = $LoadVPPFile },
+    @{ Key = "1"; Text = "Load a VPP file"; Action = $TriggerLoadVPPFile },
     @{ Key = "2"; Text = "Unload current VPP file"; Action = $UnloadVPPFile },
     @{ Key = "3"; Text = "Add files"; Action = $AddFiles },
     @{ Key = "4"; Text = "Remove a file"; Action = $RemoveFile },
